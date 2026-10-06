@@ -16,14 +16,21 @@
 
 Prefill (chunked gated delta-rule) and decode (single-token recurrence), plus
 the fused decode megakernel (in_proj + conv1d + GQA + recurrence in one @nki.jit).
+chunked_delta_rule is an fp32 prefill for both GDN and Kimi Delta Attention (KDA,
+per-channel decay) with GQA and an initial state.
 """
 
+from .chunked_delta_rule import KIND_GDN, KIND_KDA, chunked_delta_rule, chunked_delta_rule_constants
 from .gdn_block_tkg import gdn_block_tkg
 from .gdn_conv1d import gdn_conv1d_decode, gdn_conv1d_prefill
 from .gdn_cte import gdn_cte
 from .gdn_tkg import gdn_tkg
 
 __all__ = [
+    "KIND_GDN",
+    "KIND_KDA",
+    "chunked_delta_rule",
+    "chunked_delta_rule_constants",
     "gdn_block_tkg",
     "gdn_conv1d_decode",
     "gdn_conv1d_prefill",
