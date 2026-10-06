@@ -23,7 +23,7 @@ import nki.language as nl
 import numpy as np
 
 from ..utils.kernel_assert import kernel_assert
-from ..utils.kernel_helpers import div_ceil
+from ..utils.kernel_helpers import div_ceil, scalar_engine_copy
 from ..utils.logging import get_logger
 
 logger = get_logger("topk")
@@ -771,7 +771,7 @@ def insert(tensor: nl.ndarray, values: nl.ndarray, offset: int = 0) -> None:
         offset (int): Offset position for insertion (default: 0)
     """
     num_values_to_insert = values.shape[1]
-    nisa.tensor_copy(dst=tensor[:, nl.ds(offset, num_values_to_insert)], src=values, engine=nisa.scalar_engine)
+    scalar_engine_copy(dst=tensor[:, nl.ds(offset, num_values_to_insert)], src=values)
 
 
 def validate_topk_input(inp: nl.ndarray, n_fold: int = 1, local_top_k_per_stage: int = 0) -> None:
@@ -889,25 +889,34 @@ def topk_core(data: nl.ndarray, k: int) -> Tuple[nl.ndarray, nl.ndarray]:
             nisa.nc_find_index8(dst=ind_buf[...], data=data[:, :vocab_size], vals=val_buf)
 
             elts_remain = k % HW_PARAMS.topk_per_stage
-            nisa.tensor_copy(
-                dst=out_vals[:, k - elts_remain :], src=val_buf[:, :elts_remain], engine=nisa.scalar_engine
-            )
-            nisa.tensor_copy(
-                dst=out_inds[:, k - elts_remain :], src=ind_buf[:, :elts_remain], engine=nisa.scalar_engine
-            )
+            scalar_engine_copy(dst=out_vals[:, k - elts_remain :], src=val_buf[:, :elts_remain])
+            scalar_engine_copy(dst=out_inds[:, k - elts_remain :], src=ind_buf[:, :elts_remain])
 
         else:
             i_free_dim = nl.ds(fold_idx * HW_PARAMS.topk_per_stage, HW_PARAMS.topk_per_stage)
 
             nisa.max8(dst=out_vals[0:BxS, i_free_dim], src=data[:, :vocab_size])
 
-            nisa.nc_match_replace8(
-                dst=data[:, :vocab_size],
-                dst_idx=out_inds[0:BxS, i_free_dim],
-                data=data[:, :vocab_size],
-                vals=out_vals[0:BxS, i_free_dim],
-                imm=float('-inf'),
-            )
+            if nisa.get_nc_version() <= nisa.nc_version.gen2:
+                # NeuronCore-v2 has no fused match-replace-with-index (neuronx-cc: "Codegen: Unimplemented
+                # instruction ... with OpCode MaxIndexAndMatchReplace"): find the indices first, as sort() does.
+                nisa.nc_find_index8(
+                    dst=out_inds[0:BxS, i_free_dim], data=data[:, :vocab_size], vals=out_vals[0:BxS, i_free_dim]
+                )
+                nisa.nc_match_replace8(
+                    dst=data[:, :vocab_size],
+                    data=data[:, :vocab_size],
+                    vals=out_vals[0:BxS, i_free_dim],
+                    imm=float('-inf'),
+                )
+            else:
+                nisa.nc_match_replace8(
+                    dst=data[:, :vocab_size],
+                    dst_idx=out_inds[0:BxS, i_free_dim],
+                    data=data[:, :vocab_size],
+                    vals=out_vals[0:BxS, i_free_dim],
+                    imm=float('-inf'),
+                )
 
     return out_vals, out_inds
 
