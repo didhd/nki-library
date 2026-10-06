@@ -19,7 +19,7 @@ import nki.language as nl
 
 from ...utils.allocator import SbufManager
 from ...utils.interleave_copy import interleave_copy
-from ...utils.kernel_helpers import div_ceil, resolve_fp8_e4m3_dtype
+from ...utils.kernel_helpers import div_ceil, hwdge_if_supported, resolve_fp8_e4m3_dtype
 from ...utils.tiled_range import TiledRange
 from .mlp_parameters import MLPParameters, mlpp_has_down_projection_bias
 from .mlp_tkg_constants import (
@@ -249,7 +249,7 @@ def process_down_projection(
         nisa.dma_copy(
             dst=bias_tile,
             src=down_b,
-            dge_mode=nisa.dge_mode.hwdge if use_dge else adaptive_dge_mode(down_b),
+            dge_mode=hwdge_if_supported() if use_dge else adaptive_dge_mode(down_b),
         )
 
     dequant_tile = None
@@ -264,7 +264,7 @@ def process_down_projection(
         nisa.dma_copy(
             dst=dequant_tile,
             src=down_w_scale,
-            dge_mode=nisa.dge_mode.hwdge if use_dge else adaptive_dge_mode(down_w_scale),
+            dge_mode=hwdge_if_supported() if use_dge else adaptive_dge_mode(down_w_scale),
         )
 
     # ---------------- Allocate Weight Tiles ----------------

@@ -25,7 +25,7 @@ from ...utils.allocator import SbufManager
 # common utils
 from ...utils.common_types import ExpertAffinityScaleMode, GateUpDim, MoEAllToAllVStrategy, QuantizationType
 from ...utils.kernel_assert import kernel_assert
-from ...utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
+from ...utils.kernel_helpers import div_ceil, get_verified_program_sharding_info, transpose_psum_dtype
 from ...utils.logging import get_logger
 from ...utils.tiled_range import TiledRange
 from .mlp_parameters import (
@@ -1003,7 +1003,7 @@ def _gather_input_block(hidden_input, token_indices_T_sb, dims, dynamism_cfg, io
         # Reshape to [T, H0, H1_shard], then transpose [T, H0] -> [H0, T] per H1 slice
         input_tile_reshaped = input_tile_sb.reshape((tile_T_actual, H0, H1_shard))
         for h1_idx in range(H1_shard):
-            tp_psum = nl.ndarray((H0, tile_T_actual), dtype=io_dtype, buffer=nl.psum)
+            tp_psum = nl.ndarray((H0, tile_T_actual), dtype=transpose_psum_dtype(io_dtype), buffer=nl.psum)
             nisa.nc_transpose(
                 data=input_tile_reshaped[:tile_T_actual, :H0, h1_idx],
                 dst=tp_psum[:H0, :tile_T_actual],
@@ -1052,7 +1052,7 @@ def _scatter_output_block(
     out_transposed = nl.ndarray((block_T, H_per_shard), dtype=io_dtype, buffer=nl.sbuf)
     out_transposed_reshaped = out_transposed.reshape((block_T, H0, H1_shard))
     for h1_idx in range(H1_shard):
-        tp_psum = nl.ndarray((block_T, H0), dtype=io_dtype, buffer=nl.psum)
+        tp_psum = nl.ndarray((block_T, H0), dtype=transpose_psum_dtype(io_dtype), buffer=nl.psum)
         nisa.nc_transpose(dst=tp_psum[:block_T, :H0], data=output_sb[:H0, h1_idx, :block_T])
         nisa.tensor_copy(
             dst=out_transposed_reshaped[:block_T, :H0, h1_idx],
@@ -1130,7 +1130,7 @@ def _sequential_store_block(
     out_transposed = nl.ndarray((block_T, H_per_shard), dtype=io_dtype, buffer=nl.sbuf)
     out_transposed_reshaped = out_transposed.reshape((block_T, H0, H1_shard))
     for h1_idx in range(H1_shard):
-        tp_psum = nl.ndarray((block_T, H0), dtype=io_dtype, buffer=nl.psum)
+        tp_psum = nl.ndarray((block_T, H0), dtype=transpose_psum_dtype(io_dtype), buffer=nl.psum)
         nisa.nc_transpose(dst=tp_psum[:block_T, :H0], data=output_sb[:H0, h1_idx, :block_T])
         nisa.tensor_copy(
             dst=out_transposed_reshaped[:block_T, :H0, h1_idx],

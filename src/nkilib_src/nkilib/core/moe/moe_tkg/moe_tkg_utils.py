@@ -100,6 +100,12 @@ def gather_expert_affinities(
             (dims._pmax, PARTITIONS_PER_GPSIMD_CORE), dtype=nl.uint16, buffer=nl.sbuf, align=32
         )
         nisa.memset(dst=index_values, value=0)
+        # NeuronCore-v2 DMA engines transpose only from HBM into SBUF ("transpose only supported for HBM->SB",
+        # neuronx-cc 2.27 verifier), so there the indices are staged through HBM and transposed on the way back.
+        transpose_src = expert_idx_u16
+        if nisa.get_nc_version() <= nisa.nc_version.gen2:
+            transpose_src = nl.ndarray(expert_idx_u16.shape, dtype=nl.uint16, buffer=nl.shared_hbm)
+            nisa.dma_copy(dst=transpose_src, src=expert_idx_u16)
         for channel_idx in range(active_channels):
             # Use DMA Transpose for better performance with larger token counts
             nisa.dma_transpose(
@@ -112,7 +118,7 @@ def gather_expert_affinities(
                     ],
                     offset=channel_idx * PARTITIONS_PER_GPSIMD_CORE * PARTITIONS_PER_GPSIMD_CORE,
                 ),
-                src=expert_idx_u16.ap(
+                src=transpose_src.ap(
                     pattern=[
                         [PARTITIONS_PER_GPSIMD_CORE, PARTITIONS_PER_GPSIMD_CORE],
                         [1, 1],

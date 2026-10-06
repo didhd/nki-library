@@ -23,7 +23,7 @@ import nki.language as nl
 from ..utils.allocator import SbufManager, sizeinbytes
 from ..utils.interleave_copy import interleave_copy
 from ..utils.kernel_assert import kernel_assert
-from ..utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
+from ..utils.kernel_helpers import div_ceil, get_verified_program_sharding_info, transpose_psum_dtype
 from ..utils.tiled_range import TiledRange
 
 # DMA engine mode
@@ -87,7 +87,8 @@ def pe_transpose(
     P = src.shape[0]
     num_tiles = src.shape[2]
 
-    dtype_size = sizeinbytes(dtype)
+    psum_dtype = transpose_psum_dtype(dtype)
+    dtype_size = sizeinbytes(psum_dtype)
     # PSUM alignment: compute padded size for 4-byte alignment
     padded_tile_size = div_ceil(P * dtype_size, _PSUM_ALIGNMENT_BYTES) * _PSUM_ALIGNMENT_BYTES // dtype_size
     tiles_per_psum = _psum_fmax // padded_tile_size
@@ -101,7 +102,7 @@ def pe_transpose(
 
         tp_psum = nl.ndarray(
             (tile_size, cur_tiles_per_psum * padded_tile_size),
-            dtype=dtype,
+            dtype=psum_dtype,
             buffer=nl.psum,
             address=None if sbm.is_auto_alloc() else (0, psum_bank_idx * _psum_fmax * 4),
         )

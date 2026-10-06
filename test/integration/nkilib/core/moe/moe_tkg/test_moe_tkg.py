@@ -381,6 +381,22 @@ MOE_TKG_ALL_PARAMS = [
     for c in MOE_TKG_TEST_PARAMS
 ]
 
+# LNC 1 cases: the only logical NeuronCore size on trn1 (NeuronCore-v2), where every vnc=2 case above is skipped.
+# They run on trn2 too. Selective experts (fp16, FP8 ROW) and all experts (fp16), with and without bias.
+# fmt: off
+MOE_TKG_LNC1_PARAMS = [
+    # vnc, tokens, hidden, intermediate, expert, top_k, act_fn, scale_mode, all_expert, q_dtype, q_type, dtype, clamp, bias
+    pytest.param(1, 2, 512, 128, 2, 1, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, False, None, QuantizationType.NONE, nl.float16, True, False, marks=pytest.mark.fast),
+    (1, 4,  512,  128, 2,   1,    ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, False, None,           QuantizationType.NONE, nl.float16, True, True),
+    (1, 4,  3072, 192, 128, 4,    ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, False, None,           QuantizationType.NONE, nl.float16, True, True),
+    (1, 32, 3072, 384, 8,   4,    ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, False, None,           QuantizationType.NONE, nl.float16, True, True),
+    pytest.param(1, 4, 512, 64, 4, 2, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, False, nl.float8_e4m3, QuantizationType.ROW, nl.float16, True, True, marks=pytest.mark.fast),
+    (1, 4,  3072, 128, 8,   4,    ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, False, nl.float8_e4m3, QuantizationType.ROW,  nl.float16, True, True),
+    pytest.param(1, 4, 3072, 64, 4, None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True, None, QuantizationType.NONE, nl.float16, True, True, marks=pytest.mark.fast),
+    (1, 32, 3072, 512, 1,   None, ActFnType.SiLU,  ExpertAffinityScaleMode.NO_SCALE,   True,  None,           QuantizationType.NONE, nl.float16, True, False),
+]
+# fmt: on
+
 # fmt: off
 MOE_TKG_MX_PARAMS = [
     # vnc, tokens, hidden, intermediate, expert, top_k, act_fn, scale_mode,               all_expert, q_dtype,        q_type,              dtype,       clamp, bias
@@ -777,6 +793,29 @@ MOE_TKG_MODEL_PARAMS = [tuple(cfg) for cfg in moe_tkg_model_configs]
 @pytest_test_metadata(name="MoE TKG")
 @pytest_marks(["moe", "tkg"])
 class TestMoeTkgKernel:
+    @pytest_parametrize(MOE_TKG_PARAM_NAMES, MOE_TKG_LNC1_PARAMS, abbrevs=_ABBREVS)
+    def test_moe_tkg_lnc1(
+        self,
+        test_manager: Orchestrator,
+        vnc: int,
+        tokens: int,
+        hidden: int,
+        intermediate: int,
+        expert: int,
+        top_k,
+        act_fn: ActFnType,
+        scale_mode: ExpertAffinityScaleMode,
+        all_expert: bool,
+        q_dtype,
+        q_type: QuantizationType,
+        dtype,
+        clamp: bool,
+        bias: bool,
+        platform_target,
+    ):
+        kwargs = {k: v for k, v in locals().items() if k != "self"}
+        _run_moe_tkg_test(**kwargs)
+
     @pytest_parametrize(MOE_TKG_PARAM_NAMES, MOE_TKG_ALL_PARAMS, abbrevs=_ABBREVS)
     def test_moe_tkg_bfloat16(
         self,

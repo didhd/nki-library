@@ -20,7 +20,7 @@ import nki.language as nl
 from ...utils.allocator import SbufManager
 from ...utils.interleave_copy import interleave_copy
 from ...utils.kernel_assert import kernel_assert
-from ...utils.kernel_helpers import div_ceil
+from ...utils.kernel_helpers import div_ceil, hwdge_if_supported
 from ...utils.tiled_range import TiledRange
 from .mlp_parameters import MLPParameters
 from .mlp_tkg_constants import (
@@ -113,7 +113,7 @@ def down_projection_lhs_rhs_swap(
             nisa.dma_copy(
                 dst=weight_sb_tile_slice,
                 src=weight_hbm_tile_slice.slice(dim=0, start=i_tile.start_offset, end=i_tile.end_offset),
-                dge_mode=nisa.dge_mode.hwdge if use_dge else adaptive_dge_mode(weight),
+                dge_mode=hwdge_if_supported() if use_dge else adaptive_dge_mode(weight),
             )
 
             """

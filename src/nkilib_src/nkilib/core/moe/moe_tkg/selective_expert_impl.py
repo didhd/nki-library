@@ -102,7 +102,13 @@ def _selective_expert_moe_tkg(
     # TODO: Calibrate weight tile calculations and remove auto allocation workaround
     H = params.hidden_tensor.shape[-1]
     need_auto_alloc = H >= 16 * 1024 or hidden_in_sbuf
-    sbm = SbufManager(0, 200 * 1024, get_logger("selective_expert_moe_tkg"), use_auto_alloc=need_auto_alloc)
+    sbuf_bytes = 200 * 1024
+    if nisa.get_nc_version() <= nisa.nc_version.gen2:
+        # NeuronCore-v2 has 176 KiB usable per partition (nl.tile_size.sbuf_fmax_bytes), so a 200 KiB heap lands
+        # past its end. Leave the ~8 KiB that 200 KiB leaves on NeuronCore-v3 for the compiler's own SBUF tensors
+        # (the nc_transpose identity).
+        sbuf_bytes = nl.tile_size.sbuf_fmax_bytes - 8 * 1024
+    sbm = SbufManager(0, sbuf_bytes, get_logger("selective_expert_moe_tkg"), use_auto_alloc=need_auto_alloc)
     sbm.open_scope()
 
     io_dtype = params.hidden_tensor.dtype

@@ -20,7 +20,7 @@ import nki.language as nl
 from ...utils.allocator import SbufManager
 from ...utils.interleave_copy import interleave_copy
 from ...utils.kernel_assert import kernel_assert
-from ...utils.kernel_helpers import div_ceil, resolve_fp8_e4m3_dtype
+from ...utils.kernel_helpers import div_ceil, hwdge_if_supported, resolve_fp8_e4m3_dtype
 from ...utils.tiled_range import TiledRange
 from .mlp_parameters import MLPParameters
 from .mlp_tkg_constants import (
@@ -133,7 +133,7 @@ def gate_up_projection_lhs_rhs_swap(
         nisa.dma_copy(
             dst=weight_sb_tile_slice,
             src=weight_view,
-            dge_mode=nisa.dge_mode.hwdge,
+            dge_mode=hwdge_if_supported(),
         )
 
         # Matmult
@@ -276,12 +276,12 @@ def run_gate_up_projection_lhs_rhs_swap(
         nisa.dma_copy(
             dst=gate_dequant_tile,
             src=gate_w_scale_view,
-            dge_mode=nisa.dge_mode.hwdge if use_dge else adaptive_dge_mode(gate_w_scale_view),
+            dge_mode=hwdge_if_supported() if use_dge else adaptive_dge_mode(gate_w_scale_view),
         )
         nisa.dma_copy(
             dst=up_dequant_tile,
             src=up_w_scale_view,
-            dge_mode=nisa.dge_mode.hwdge if use_dge else adaptive_dge_mode(up_w_scale_view),
+            dge_mode=hwdge_if_supported() if use_dge else adaptive_dge_mode(up_w_scale_view),
         )
 
     elif params.quant_params.is_quant_row():

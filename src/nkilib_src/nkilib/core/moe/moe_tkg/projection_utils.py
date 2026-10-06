@@ -25,7 +25,7 @@ from ...utils.allocator import SbufManager
 from ...utils.common_types import HiddenLayout, NormType
 from ...utils.interleave_copy import interleave_copy
 from ...utils.kernel_assert import kernel_assert
-from ...utils.kernel_helpers import div_ceil
+from ...utils.kernel_helpers import div_ceil, hwdge_if_supported, scalar_engine_copy, transpose_psum_dtype
 from .mlp_parameters import (
     _Q_WIDTH,
     MLPParameters,
@@ -615,7 +615,9 @@ def _load_transposed_tile(
             name=f"{op_name}_{sbm.get_name_prefix()}_transpose_sbuf",
         )
         nisa.memset(tmp_sbuf, 0)
-        tmp_psum = nl.ndarray((tile_size, num_padded_tiles), dtype=src_tensor.dtype, buffer=nl.psum)
+        tmp_psum = nl.ndarray(
+            (tile_size, num_padded_tiles), dtype=transpose_psum_dtype(src_tensor.dtype), buffer=nl.psum
+        )
         if num_full_tiles > 0:
             full_src = src_tensor.slice(dim=src_dim, start=0, end=num_full_tiles * tile_size).reshape_dim(
                 dim=src_dim, shape=(num_full_tiles, tile_size)
@@ -627,17 +629,17 @@ def _load_transposed_tile(
                         pattern=[[tile_size, num_full_tiles], [1, tile_size]],
                         offset=0,
                     ),
-                    dge_mode=nisa.dge_mode.hwdge,
+                    dge_mode=hwdge_if_supported(),
                 )
             else:
                 while full_src.ndim < 4:
                     full_src = full_src.expand_dim(1)
-                nisa.dma_copy(src=full_src, dst=tmp_sbuf[:num_full_tiles, :tile_size], dge_mode=nisa.dge_mode.hwdge)
+                nisa.dma_copy(src=full_src, dst=tmp_sbuf[:num_full_tiles, :tile_size], dge_mode=hwdge_if_supported())
         res_src = src_tensor.slice(dim=src_dim, start=num_full_tiles * tile_size, end=total_size).expand_dim(1)
         nisa.dma_copy(
             src=res_src,
             dst=tmp_sbuf[num_full_tiles : num_full_tiles + 1, :res_elements],
-            dge_mode=nisa.dge_mode.hwdge,
+            dge_mode=hwdge_if_supported(),
         )
         nisa.nc_transpose(dst=tmp_psum, data=tmp_sbuf)
         nisa.tensor_copy(dst=dst_tile.slice(dim=1, start=0, end=num_padded_tiles), src=tmp_psum)
@@ -663,7 +665,9 @@ def _load_transposed_tile(
                 buffer=nl.sbuf,
                 name=f"{op_name}_{sbm.get_name_prefix()}_transpose_sbuf",
             )
-            tmp_psum = nl.ndarray((tile_size, num_full_tiles), dtype=src_tensor.dtype, buffer=nl.psum)
+            tmp_psum = nl.ndarray(
+                (tile_size, num_full_tiles), dtype=transpose_psum_dtype(src_tensor.dtype), buffer=nl.psum
+            )
             if src_view._scalar_offset is not None and src_view._indirect_dim is not None:
                 nisa.dma_copy(
                     src=src_view,
@@ -671,7 +675,7 @@ def _load_transposed_tile(
                         pattern=[[tile_size, num_full_tiles], [1, tile_size]],
                         offset=0,
                     ),
-                    dge_mode=nisa.dge_mode.hwdge if use_dge else adaptive_dge_mode(src_view),
+                    dge_mode=hwdge_if_supported() if use_dge else adaptive_dge_mode(src_view),
                 )
             else:
                 while src_view.ndim < 4:
@@ -679,7 +683,7 @@ def _load_transposed_tile(
                 nisa.dma_copy(
                     src=src_view,
                     dst=tmp_sbuf,
-                    dge_mode=nisa.dge_mode.hwdge if use_dge else _DGE_MODE_NONE,
+                    dge_mode=hwdge_if_supported() if use_dge else _DGE_MODE_NONE,
                 )
             nisa.nc_transpose(dst=tmp_psum, data=tmp_sbuf)
             nisa.tensor_copy(dst=dst_tile.slice(dim=1, start=0, end=num_full_tiles), src=tmp_psum)
@@ -691,7 +695,7 @@ def _load_transposed_tile(
             dst=dst_tile.slice(dim=0, start=0, end=res_elements).slice(
                 dim=1, start=num_full_tiles, end=num_full_tiles + 1
             ),
-            dge_mode=nisa.dge_mode.hwdge if use_dge else adaptive_dge_mode(src_view),
+            dge_mode=hwdge_if_supported() if use_dge else adaptive_dge_mode(src_view),
         )
 
 
@@ -740,7 +744,7 @@ def transpose_store(
         psum_idx = h1_tile_idx % dims._psum_bmax
         tp_psum = nl.ndarray(
             (T, H0),
-            dtype=output_dtype,
+            dtype=transpose_psum_dtype(output_dtype),
             buffer=nl.psum,
             address=None if sbm.is_auto_alloc() else (0, psum_idx * dims._psum_fmax * 4),
         )
@@ -801,7 +805,7 @@ def transpose_store_sbuf_copy(
         src_ap = output_temp.ap(pattern=src_copy_pat, offset=token)
         dst_ap = output_reshape.ap(pattern=dst_copy_pat, offset=token * H1_shard)
         if token % 2 == 0:
-            nisa.tensor_copy(dst=dst_ap, src=src_ap, engine=nisa.scalar_engine)
+            scalar_engine_copy(dst=dst_ap, src=src_ap)
         else:
             nisa.tensor_copy(dst=dst_ap, src=src_ap, engine=nisa.vector_engine)
 
