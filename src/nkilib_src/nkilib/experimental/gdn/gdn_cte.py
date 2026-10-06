@@ -44,6 +44,7 @@ import nki.isa as nisa
 import nki.language as nl
 
 from ...core.utils.kernel_assert import kernel_assert
+from ...core.utils.kernel_helpers import sbuf_transpose, scalar_engine_copy, scalar_engine_multiply
 
 _CHUNK = 64
 _SUBBLK = 16
@@ -155,6 +156,14 @@ def gdn_cte(
             # ---- Pass 1a: per-chunk setup (cg, decay, A_masked); store for batched Phase 1 ----
             group_state = [None] * cpg
             _GROUP_ROWS = cpg * _SUBBLK
+            # PE tiling (tile_position / tile_size) needs NeuronCore-v3+: on NeuronCore-v2 neuronx-cc refuses it
+            # ("Matmult instruction does not support PE tile size 32x32 on CoreV2", NCC_IBIR058). There the
+            # [_GROUP_ROWS, _GROUP_ROWS] matmuls run on the whole array (nc_matmul's defaults, tile_position=()
+            # and tile_size=()), with the same result.
+            if nisa.get_nc_version() <= nisa.nc_version.gen2:
+                pe_pos, pe_size = (), ()
+            else:
+                pe_pos, pe_size = (0, 0), (_GROUP_ROWS, _GROUP_ROWS)
             # Block-diag identity for this group's solve: top-left cpg*_SUBBLK slice of Ident_gr.
             Ident_g = Ident_gr[nl.ds(0, _GROUP_ROWS), nl.ds(0, _GROUP_ROWS)]
             # Group-contiguous load: ONE strided-AP DMA per tensor pulls the whole group's tokens
@@ -211,7 +220,7 @@ def gdn_cte(
                 # cg_row [1,_CHUNK] is still needed by Phase-2/3 (last-element broadcast + dte subtract);
                 # regenerate it from the column via one transpose (was: scan produced it directly).
                 cg_row = nl.ndarray((1, _CHUNK), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.dma_transpose(dst=cg_row, src=cg)
+                sbuf_transpose(dst=cg_row, src=cg)
                 exp_cg = nl.ndarray((_CHUNK, 1), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.activation(dst=exp_cg, data=cg, op=nl.exp)
 
@@ -229,7 +238,7 @@ def gdn_cte(
                 nisa.activation(dst=decay, data=log_decay_safe, op=nl.exp)
 
                 k_t = nl.ndarray((D, _CHUNK), dtype=dtype, buffer=nl.sbuf)
-                nisa.dma_transpose(dst=k_t, src=k_sb)
+                sbuf_transpose(dst=k_t, src=k_sb)
                 kkt_p = nl.ndarray((_CHUNK, _CHUNK), dtype=nl.float32, buffer=nl.psum)
                 nisa.nc_matmul(kkt_p, k_t, k_t)
                 # kkt_decay = kkt * decay reading kkt straight from PSUM (drop the separate eviction copy).
@@ -238,7 +247,7 @@ def gdn_cte(
                 neg_beta = nl.ndarray((_CHUNK, 1), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.tensor_scalar(neg_beta, beta_sb, op0=nl.multiply, operand0=-1.0)
                 A_full = nl.ndarray((_CHUNK, _CHUNK), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_scalar(A_full, kkt_decay, op0=nl.multiply, operand0=neg_beta, engine=nisa.scalar_engine)
+                scalar_engine_multiply(A_full, kkt_decay, neg_beta)
                 A_masked = nl.ndarray((_CHUNK, _CHUNK), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.affine_select(
                     A_masked,
@@ -258,9 +267,9 @@ def gdn_cte(
                 rhs_w_full = rhs_w_grp[:, nl.ds(c * D, D)]
                 rhs_u_full = rhs_u_grp[:, nl.ds(c * D, D)]
                 rwtmp = nl.ndarray((_CHUNK, D), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_scalar(rwtmp, k_sb, op0=nl.multiply, operand0=beta_sb, engine=nisa.scalar_engine)
-                nisa.tensor_scalar(rhs_w_full, rwtmp, op0=nl.multiply, operand0=exp_cg, engine=nisa.scalar_engine)
-                nisa.tensor_scalar(rhs_u_full, v_sb, op0=nl.multiply, operand0=beta_sb, engine=nisa.scalar_engine)
+                scalar_engine_multiply(rwtmp, k_sb, beta_sb)
+                scalar_engine_multiply(rhs_w_full, rwtmp, exp_cg)
+                scalar_engine_multiply(rhs_u_full, v_sb, beta_sb)
                 # Keep the group's per-chunk Phase-1 tensors RESIDENT in SBUF (no HBM staging).
                 group_state[c] = {
                     "q_sb": q_sb,
@@ -347,7 +356,7 @@ def gdn_cte(
                     slot = bi * _N_SUBBLK + bj
                     op_view = Ball[:, nl.ds(slot * _GROUP_ROWS, _GROUP_ROWS)]
                     opt = nl.ndarray((_GROUP_ROWS, _GROUP_ROWS), dtype=dtype, buffer=nl.sbuf)
-                    nisa.dma_transpose(dst=opt, src=op_view)
+                    sbuf_transpose(dst=opt, src=op_view)
                     if bj == bi:
                         Ndiag_pre[bi] = op_view
                         Mdiag_pre[bi] = opt
@@ -409,8 +418,8 @@ def gdn_cte(
                             cwp,
                             Aijt,
                             Wj,
-                            tile_position=(0, 0),
-                            tile_size=(_GROUP_ROWS, _GROUP_ROWS),
+                            tile_position=pe_pos,
+                            tile_size=pe_size,
                             accumulate=(bj > 0),
                         )
                         Uj = nl.ndarray((_GROUP_ROWS, D), dtype=dtype, buffer=nl.sbuf)
@@ -419,8 +428,8 @@ def gdn_cte(
                             cup,
                             Aijt,
                             Uj,
-                            tile_position=(0, 0),
-                            tile_size=(_GROUP_ROWS, _GROUP_ROWS),
+                            tile_position=pe_pos,
+                            tile_size=pe_size,
                             accumulate=(bj > 0),
                         )
                     nisa.tensor_tensor(dst=rhs_w, data1=rhs_w, data2=cwp, op=nl.add)
@@ -435,31 +444,31 @@ def gdn_cte(
                 P = Mdiag_pre[bi]  # P = A_ii^T
                 PT_stat = Ndiag_pre[bi]  # P^T = A_ii
                 MT = nl.ndarray((_GROUP_ROWS, _GROUP_ROWS), dtype=dtype, buffer=nl.sbuf)
-                nisa.tensor_copy(dst=MT, src=Ident_g, engine=nisa.scalar_engine)
+                scalar_engine_copy(dst=MT, src=Ident_g)
                 for _rd in range(_N_ROUNDS):
                     pMT = nl.ndarray((_GROUP_ROWS, _GROUP_ROWS), dtype=nl.float32, buffer=nl.psum)
-                    nisa.nc_matmul(pMT, PT_stat, MT, tile_position=(0, 0), tile_size=(_GROUP_ROWS, _GROUP_ROWS))
+                    nisa.nc_matmul(pMT, PT_stat, MT, tile_position=pe_pos, tile_size=pe_size)
                     MT_new = nl.ndarray((_GROUP_ROWS, _GROUP_ROWS), dtype=dtype, buffer=nl.sbuf)
                     nisa.tensor_tensor(dst=MT_new, data1=MT, data2=pMT, op=nl.add)
                     MT = MT_new
                     if _rd < _N_ROUNDS - 1:
                         pp = nl.ndarray((_GROUP_ROWS, _GROUP_ROWS), dtype=nl.float32, buffer=nl.psum)
-                        nisa.nc_matmul(pp, PT_stat, P, tile_position=(0, 0), tile_size=(_GROUP_ROWS, _GROUP_ROWS))
+                        nisa.nc_matmul(pp, PT_stat, P, tile_position=pe_pos, tile_size=pe_size)
                         ppt = nl.ndarray((_GROUP_ROWS, _GROUP_ROWS), dtype=nl.float32, buffer=nl.psum)
-                        nisa.nc_matmul(ppt, P, PT_stat, tile_position=(0, 0), tile_size=(_GROUP_ROWS, _GROUP_ROWS))
+                        nisa.nc_matmul(ppt, P, PT_stat, tile_position=pe_pos, tile_size=pe_size)
                         P = nl.ndarray((_GROUP_ROWS, _GROUP_ROWS), dtype=dtype, buffer=nl.sbuf)
-                        nisa.tensor_copy(dst=P, src=pp, engine=nisa.scalar_engine)
+                        scalar_engine_copy(dst=P, src=pp)
                         PT_stat = nl.ndarray((_GROUP_ROWS, _GROUP_ROWS), dtype=dtype, buffer=nl.sbuf)
-                        nisa.tensor_copy(dst=PT_stat, src=ppt, engine=nisa.scalar_engine)
+                        scalar_engine_copy(dst=PT_stat, src=ppt)
                 # Apply shared MT to both rhs: W=nc_matmul(MT,rhs_w), U=nc_matmul(MT,rhs_u).
                 rhs_w_b = nl.ndarray((_GROUP_ROWS, D), dtype=dtype, buffer=nl.sbuf)
-                nisa.tensor_copy(dst=rhs_w_b, src=rhs_w, engine=nisa.scalar_engine)
+                scalar_engine_copy(dst=rhs_w_b, src=rhs_w)
                 rhs_u_b = nl.ndarray((_GROUP_ROWS, D), dtype=dtype, buffer=nl.sbuf)
-                nisa.tensor_copy(dst=rhs_u_b, src=rhs_u, engine=nisa.scalar_engine)
+                scalar_engine_copy(dst=rhs_u_b, src=rhs_u)
                 yW = nl.ndarray((_GROUP_ROWS, D), dtype=nl.float32, buffer=nl.psum)
-                nisa.nc_matmul(yW, MT, rhs_w_b, tile_position=(0, 0), tile_size=(_GROUP_ROWS, _GROUP_ROWS))
+                nisa.nc_matmul(yW, MT, rhs_w_b, tile_position=pe_pos, tile_size=pe_size)
                 yU = nl.ndarray((_GROUP_ROWS, D), dtype=nl.float32, buffer=nl.psum)
-                nisa.nc_matmul(yU, MT, rhs_u_b, tile_position=(0, 0), tile_size=(_GROUP_ROWS, _GROUP_ROWS))
+                nisa.nc_matmul(yU, MT, rhs_u_b, tile_position=pe_pos, tile_size=pe_size)
                 # store into contiguous grp buffers (bi on free); expose free-views for coupling reads.
                 nisa.tensor_copy(dst=Wg_grp[:, nl.ds(bi * D, D)], src=yW, engine=nisa.vector_engine)
                 nisa.tensor_copy(dst=Ug_grp[:, nl.ds(bi * D, D)], src=yU, engine=nisa.vector_engine)
@@ -514,21 +523,19 @@ def gdn_cte(
 
                 # o_cross = q @ state * exp_cg * scale (uses state at start of chunk)
                 q_t = nl.ndarray((D, _CHUNK), dtype=dtype, buffer=nl.sbuf)
-                nisa.dma_transpose(dst=q_t, src=q_sb)
+                sbuf_transpose(dst=q_t, src=q_sb)
                 o_cross_p = nl.ndarray((_CHUNK, D), dtype=nl.float32, buffer=nl.psum)
                 nisa.nc_matmul(o_cross_p, q_t, state_bf16)
                 exp_cg_scaled = nl.ndarray((_CHUNK, 1), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.tensor_scalar(exp_cg_scaled, exp_cg, op0=nl.multiply, operand0=scale)
                 o_cross = nl.ndarray((_CHUNK, D), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_scalar(
-                    o_cross, o_cross_p, op0=nl.multiply, operand0=exp_cg_scaled, engine=nisa.scalar_engine
-                )
+                scalar_engine_multiply(o_cross, o_cross_p, exp_cg_scaled)
 
                 # qkt_masked for intra-chunk output: lower-tri-inclusive
                 qkt_p = nl.ndarray((_CHUNK, _CHUNK), dtype=nl.float32, buffer=nl.psum)
                 nisa.nc_matmul(qkt_p, q_t, k_t)
                 qkt_s = nl.ndarray((_CHUNK, _CHUNK), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_copy(dst=qkt_s, src=qkt_p, engine=nisa.scalar_engine)
+                scalar_engine_copy(dst=qkt_s, src=qkt_p)
                 qkt_decay = nl.ndarray((_CHUNK, _CHUNK), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.tensor_tensor(qkt_decay, qkt_s, decay, op=nl.multiply)
                 qkt_masked = nl.ndarray((_CHUNK, _CHUNK), dtype=nl.float32, buffer=nl.sbuf)
@@ -557,12 +564,10 @@ def gdn_cte(
                 exp_g_last_1D = nl.ndarray((1, D), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.activation(dst=exp_g_last_1D, data=cg_last_1D, op=nl.exp)
                 exp_g_last_D1 = nl.ndarray((D, 1), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.dma_transpose(dst=exp_g_last_D1, src=exp_g_last_1D)
+                sbuf_transpose(dst=exp_g_last_D1, src=exp_g_last_1D)
 
                 state_decayed = nl.ndarray((D, D), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_scalar(
-                    state_decayed, state, op0=nl.multiply, operand0=exp_g_last_D1, engine=nisa.scalar_engine
-                )
+                scalar_engine_multiply(state_decayed, state, exp_g_last_D1)
                 nisa.tensor_copy(dst=state, src=state_decayed, engine=nisa.vector_engine)
 
                 # === WHOLE-CHUNK FACTORED Phase-2/3 (math-identical to per-sub-block, verified ~1e-16).
@@ -586,13 +591,13 @@ def gdn_cte(
                 dte_1C = nl.ndarray((1, _CHUNK), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.activation(dst=dte_1C, data=log_dte_1C, op=nl.exp)
                 dte_C1 = nl.ndarray((_CHUNK, 1), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.dma_transpose(dst=dte_C1, src=dte_1C)
+                sbuf_transpose(dst=dte_C1, src=dte_1C)
                 k_dec_full = nl.ndarray((_CHUNK, D), dtype=dtype, buffer=nl.sbuf)
-                nisa.tensor_scalar(k_dec_full, k_sb, op0=nl.multiply, operand0=dte_C1, engine=nisa.scalar_engine)
+                scalar_engine_multiply(k_dec_full, k_sb, dte_C1)
 
                 # v_new = U - W @ S0  (S0=pre-decay state_bf16). W@S0 = matmul(W^T[D,64], S0[D,D]) -> [64,D]
                 W_t = nl.ndarray((D, _CHUNK), dtype=dtype, buffer=nl.sbuf)
-                nisa.dma_transpose(dst=W_t, src=W_full)
+                sbuf_transpose(dst=W_t, src=W_full)
                 WS_p = nl.ndarray((_CHUNK, D), dtype=nl.float32, buffer=nl.psum)
                 nisa.nc_matmul(WS_p, W_t, state_bf16)
                 v_new = nl.ndarray((_CHUNK, D), dtype=nl.float32, buffer=nl.sbuf)
@@ -604,11 +609,11 @@ def gdn_cte(
                 qkt_m_bf16 = nl.ndarray((_CHUNK, _CHUNK), dtype=dtype, buffer=nl.sbuf)
                 nisa.tensor_copy(dst=qkt_m_bf16, src=qkt_masked, engine=nisa.vector_engine)
                 qkt_m_t = nl.ndarray((_CHUNK, _CHUNK), dtype=dtype, buffer=nl.sbuf)
-                nisa.dma_transpose(dst=qkt_m_t, src=qkt_m_bf16)
+                sbuf_transpose(dst=qkt_m_t, src=qkt_m_bf16)
                 o_intra_p = nl.ndarray((_CHUNK, D), dtype=nl.float32, buffer=nl.psum)
                 nisa.nc_matmul(o_intra_p, qkt_m_t, v_new_bf16)
                 o_intra = nl.ndarray((_CHUNK, D), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_scalar(o_intra, o_intra_p, op0=nl.multiply, operand0=scale, engine=nisa.scalar_engine)
+                scalar_engine_multiply(o_intra, o_intra_p, scale)
 
                 # state = state_decayed + k_dec^T @ v_new = matmul(k_dec[64,D], v_new[64,D]) -> [D,D] (no transpose)
                 su_p = nl.ndarray((D, D), dtype=nl.float32, buffer=nl.psum)
@@ -624,7 +629,7 @@ def gdn_cte(
 
         # Store final state
         state_for_dma = nl.ndarray((D, D), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_scalar(state_for_dma, state, op0=nl.multiply, operand0=1.0, engine=nisa.scalar_engine)
+        scalar_engine_multiply(state_for_dma, state, 1.0)
         nisa.dma_copy(dst=state_output[batch_id, nl.ds(0, D), nl.ds(0, D)], src=state_for_dma)
 
     return result, state_output

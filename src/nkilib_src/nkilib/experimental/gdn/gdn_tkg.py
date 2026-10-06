@@ -52,6 +52,7 @@ import nki.isa as nisa
 import nki.language as nl
 
 from ...core.utils.kernel_assert import kernel_assert
+from ...core.utils.kernel_helpers import scalar_engine_copy
 from ...core.utils.logging import get_logger
 from ...core.utils.stream_shuffle_broadcast import stream_shuffle_broadcast
 
@@ -277,7 +278,7 @@ def gdn_tkg(
         nisa.tensor_scalar(S, S, op0=nl.multiply, operand0=g_K_h)
 
         # Cast S to bf16
-        nisa.tensor_copy(dst=S_bf, src=S, engine=nisa.scalar_engine)
+        scalar_engine_copy(dst=S_bf, src=S)
 
         # Step 2: kv_mem = k^T @ S
         kv_p = nl.ndarray((1, V), dtype=nl.float32, buffer=nl.psum)
@@ -291,20 +292,20 @@ def gdn_tkg(
 
         # Step 4: S += outer(k, delta)
         delta_bf = nl.ndarray((1, V), dtype=nl.bfloat16, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=delta_bf, src=delta, engine=nisa.scalar_engine)
+        scalar_engine_copy(dst=delta_bf, src=delta)
         outer_p = nl.ndarray((K, V), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_matmul(outer_p, k_f, delta_bf)
         nisa.tensor_tensor(dst=S, data1=S, data2=outer_p, op=nl.add)
 
         # Step 5: out = q_scaled^T @ S (refresh S_bf)
-        nisa.tensor_copy(dst=S_bf, src=S, engine=nisa.scalar_engine)
+        scalar_engine_copy(dst=S_bf, src=S)
         out_p = nl.ndarray((1, V), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_matmul(out_p, q_p, S_bf)
 
         # Fold 4: RMSNormGated. out = (o*rsqrt(mean_V(o^2)+eps)) * norm_weight * silu(z).
         # P=1 here (one head), V on free axis => reduce over free, all broadcasts free-axis.
         o_sb = nl.ndarray((1, V), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=o_sb, src=out_p, engine=nisa.scalar_engine)
+        scalar_engine_copy(dst=o_sb, src=out_p)
         ssum = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
         sq = nl.ndarray((1, V), dtype=nl.float32, buffer=nl.sbuf)
         nisa.activation_reduce(sq, op=nl.square, data=o_sb, reduce_op=nl.add, reduce_res=ssum)
