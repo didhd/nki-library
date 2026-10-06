@@ -931,6 +931,9 @@ class Orchestrator:
                 64,
                 128,
             ]
+        elif platform_target == Platforms.TRN1:
+            # trn1.2xlarge: 1 device x 2 NeuronCore-v2; trn1.32xlarge / trn1n.32xlarge: 16 x 2.
+            assert sum(neuron_info.nc_count for neuron_info in attached_neuron_devices) in [2, 32]
         else:
             raise Exception(f"{platform_target} is currently unsupported by this test framework!")
 

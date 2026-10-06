@@ -639,6 +639,12 @@ class CompilerArgs:
             self.logical_nc_config = self.__get_logical_nc_config_for_platform__()
         else:
             self.logical_nc_config = logical_nc_config
+        if self.platform_target == Platforms.TRN1 and self.logical_nc_config > 1:
+            # NeuronCore-v2 has no logical NeuronCores; neuronx-cc refuses the case with NCC_EARG001
+            # ("Logical Neuron Core size 2 is not supported on trn1"), which is a property of the platform.
+            import pytest
+
+            pytest.skip(f"LNC {self.logical_nc_config} needs NeuronCore-v3+; trn1 runs LNC 1 only")
 
     def __get_logical_nc_config_for_platform__(self) -> int:
         platform_to_logical_nc_config: dict[Platforms, int] = {
@@ -732,6 +738,11 @@ class NeuronDeviceInfo:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "NeuronDeviceInfo":
         """Create NeuronDeviceInfo from dictionary (parsed JSON)."""
+        instance_type = data.get("instance_type", "")
+        # neuron-ls prints no logical_neuroncore_config on NeuronCore-v2 hosts (trn1, trn1n, inf2), which have no
+        # logical NeuronCores: one NeuronCore per entry of neuroncore_ids. The LNC 2 default would count twice as
+        # many cores and hand out ids the runtime cannot map ("Unable to find a physical core for logical core 3").
+        default_lnc = 1 if instance_type.startswith(("trn1", "inf2")) else cls.logical_neuroncore_config
         return cls(
             neuron_device=data["neuron_device"],
             bdf=data["bdf"],
@@ -739,11 +750,11 @@ class NeuronDeviceInfo:
             numa_node=data["numa_node"],
             connected_to=data.get("connected_to"),
             nc_count=data["nc_count"],
-            logical_neuroncore_config=data.get("logical_neuroncore_config", cls.logical_neuroncore_config),
+            logical_neuroncore_config=data.get("logical_neuroncore_config", default_lnc),
             memory_size=data["memory_size"],
             neuroncore_ids=data["neuroncore_ids"],
             neuron_processes=data.get("neuron_processes", []),
-            instance_type=data.get("instance_type", ""),
+            instance_type=instance_type,
         )
 
     def get_memory_size_gb(self) -> float:
