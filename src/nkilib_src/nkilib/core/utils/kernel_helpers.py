@@ -260,6 +260,111 @@ def apply_activation(dst, data, act_fn: ActFnType, scale=1.0):
         nisa.activation(dst=dst, data=data, op=nl_op, scale=scale)
 
 
+def hwdge_if_supported():
+    """
+    DMA descriptor-generation mode: hardware DGE where the NeuronCore has it, else let the compiler choose.
+
+    nisa.dge_mode.hwdge is NeuronCore-v3+ ("dge_mode.hwdge is only supported for
+    NeuronCore-v3 or newer", nki 0.6.0 nki/isa/_validation.py). NeuronCore-v2
+    (Trn1/Inf2) has no hardware DGE, so there this returns dge_mode.unknown: the
+    compiler issues a static access pattern as a plain DMA and generates the
+    descriptors of a dynamic (indirect) one in software.
+
+    Returns:
+        nisa.dge_mode: hwdge on NeuronCore-v3+, unknown on NeuronCore-v2.
+    """
+    if nisa.get_nc_version() <= nisa.nc_version.gen2:
+        return nisa.dge_mode.unknown
+    return nisa.dge_mode.hwdge
+
+
+def transpose_psum_dtype(dtype):
+    """
+    PSUM dtype for the destination of an nc_transpose of `dtype` data on the Tensor Engine.
+
+    NeuronCore-v2 (Trn1/Inf2) writes only fp32 PSUM from the Tensor Engine, in
+    transpose mode too ("nc_matmul (transpose mode) dst dtype must be float32 on
+    gen2", nki 0.6.0). A 2-byte input passes through fp32 exactly. Newer
+    generations transpose into PSUM of the input dtype, as written.
+
+    Args:
+        dtype: dtype of the data being transposed.
+
+    Returns:
+        nl.float32 on NeuronCore-v2, else dtype.
+    """
+    if nisa.get_nc_version() <= nisa.nc_version.gen2:
+        return nl.float32
+    return dtype
+
+
+def scalar_engine_copy(dst, src):
+    """
+    Copy src to dst on the Scalar Engine, on every NeuronCore generation.
+
+    nisa.tensor_copy(engine=nisa.scalar_engine) is rejected on NeuronCore-v2
+    (Trn1/Inf2): "tensor_copy does not support engine.scalar on NeuronCore-v2
+    (Trn1/Inf2). Use nisa.activation with op=nl.copy instead." (nki 0.6.0,
+    nki/isa/_copy.py). On NeuronCore-v2 this issues that activation copy, which
+    runs on the same engine, so the engine assignment of the calling kernel is
+    unchanged. Newer generations keep the tensor_copy instruction as written.
+
+    Args:
+        dst: Destination tensor slice (SBUF).
+        src: Source tensor slice (SBUF or PSUM).
+    """
+    if nisa.get_nc_version() <= nisa.nc_version.gen2:
+        nisa.activation(dst=dst, data=src, op=nl.copy)
+    else:
+        nisa.tensor_copy(dst=dst, src=src, engine=nisa.scalar_engine)
+
+
+def scalar_engine_multiply(dst, data, operand):
+    """
+    dst = data * operand on the Scalar Engine, on every NeuronCore generation.
+
+    nisa.tensor_scalar(engine=nisa.scalar_engine) is rejected on NeuronCore-v2
+    (Trn1/Inf2) when the kernel is lowered: "'nisa.tensor_scalar_arith' op Scalar
+    engine not supported on trn1" (neuronx-cc 2.27). The Scalar Engine's
+    activation computes op(data * scale) with scale a float or a per-partition
+    [P, 1] fp32 tensor, so on NeuronCore-v2 the product is an activation copy with
+    scale=operand, on the same engine. Newer generations keep tensor_scalar.
+
+    Args:
+        dst: Destination tensor slice (SBUF).
+        data: Source tensor slice (SBUF or PSUM).
+        operand: A float, or a [P, 1] fp32 SBUF tensor broadcast along the free axis.
+    """
+    if nisa.get_nc_version() <= nisa.nc_version.gen2:
+        nisa.activation(dst=dst, data=data, op=nl.copy, scale=operand)
+    else:
+        nisa.tensor_scalar(dst, data, op0=nl.multiply, operand0=operand, engine=nisa.scalar_engine)
+
+
+def sbuf_transpose(dst, src):
+    """
+    dst[F, P] = src[P, F] transposed, both in SBUF, on every NeuronCore generation.
+
+    NeuronCore-v2 (Trn1/Inf2) DMA engines transpose only from HBM into SBUF: an
+    SBUF -> SBUF nisa.dma_transpose fails the neuronx-cc 2.27 verifier with
+    "transpose only supported for HBM->SB" (birverifier::checkDMATranspose). On
+    NeuronCore-v2 this is a Tensor Engine transpose into fp32 PSUM followed by a
+    Vector Engine copy, so P and F must be <= 128 there. Newer generations keep
+    the DMA transpose as written.
+
+    Args:
+        dst: Destination SBUF tensor slice [F, P].
+        src: Source SBUF tensor slice [P, F].
+    """
+    if nisa.get_nc_version() <= nisa.nc_version.gen2:
+        # nc_matmul (and so nc_transpose) must write fp32 PSUM on NeuronCore-v2.
+        tp = nl.ndarray(tuple(dst.shape), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_transpose(dst=tp, data=src)
+        nisa.tensor_copy(dst=dst, src=tp, engine=nisa.vector_engine)
+    else:
+        nisa.dma_transpose(dst=dst, src=src)
+
+
 def apply_activation_dx(dst, data, act_fn: ActFnType):
     """
     Apply activation derivative to data, writing result to dst.
